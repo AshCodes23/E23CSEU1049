@@ -1035,3 +1035,65 @@ function push_worker(job):
 | **DB insert is NOT transactional with email** | In-app notification is guaranteed; email is best-effort. A student should see the notification even if their email bounces. |
 
 ---
+
+## Stage 6: Priority Inbox — Implementation & Approach
+
+### 6.1 Problem Statement
+
+Display the top **N** most important unread notifications based on:
+- **Weight:** Placement (3) > Result (2) > Event (1)
+- **Recency:** More recent notifications rank higher within the same type
+
+### 6.2 Approach — Min-Heap of Size N
+
+We use a **Min-Heap** (Python's `heapq`) capped at size N to efficiently maintain the top N notifications.
+
+**Priority Score Formula:**
+
+```
+score = type_weight * 1,000,000 + unix_timestamp
+```
+
+This ensures weight is the **primary** sorting factor and recency is the **tiebreaker** within the same type.
+
+### 6.3 Algorithm
+
+```
+1. Initialize an empty min-heap of capacity N
+2. For each notification in the stream:
+   a. Compute its priority_score
+   b. If heap.size < N:  push the notification
+   c. Else if notification.score > heap.min.score:
+      → heapreplace (pop min, push new) — O(log N)
+   d. Else: discard — O(1)
+3. Extract sorted top-N: sort the heap in descending order — O(N log N)
+```
+
+### 6.4 Complexity Analysis
+
+| Operation | Time | Space |
+|-----------|------|-------|
+| Insert one notification | O(log N) | O(1) |
+| Build from M notifications | O(M log N) | O(N) |
+| Get sorted top-N | O(N log N) | O(N) |
+| Peek at minimum | O(1) | — |
+
+For N=10 and M=100 notifications: ~100 * log(10) ≈ 330 comparisons — extremely fast.
+
+### 6.5 Handling New Incoming Notifications
+
+When a new notification arrives (from WebSocket or API polling):
+
+1. **Compare** its score with the heap's minimum (O(1) peek).
+2. If higher → **replace** the minimum with `heapreplace()` → O(log N).
+3. If lower → **discard** → O(1).
+
+The top-N is maintained **incrementally** — no need to re-sort all notifications.
+
+### 6.6 Implementation
+
+See [`priority_inbox/priority_inbox.py`](./priority_inbox/priority_inbox.py) for the complete working implementation.
+
+**Output screenshots:** See [`priority_inbox/screenshots/`](./priority_inbox/screenshots/) directory.
+
+---

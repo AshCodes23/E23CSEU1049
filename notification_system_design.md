@@ -346,3 +346,232 @@ Every error follows this shape:
 | 500 | Internal Server Error |
 
 ---
+
+## Stage 2: Database Design, Schema & Queries
+
+### 2.1 Choice of Database — PostgreSQL (Relational)
+
+**Why PostgreSQL?**
+
+| Factor | Why it suits this project |
+|--------|--------------------------|
+| **Structured data** | Notifications have a well-defined schema (type, message, timestamps, read status). Relational tables map naturally. |
+| **ACID transactions** | When an HR clicks "Notify All", we need atomicity — either all 50,000 inserts succeed within a batch, or none do. |
+| **Rich querying** | We need filters (type, read status), pagination (`LIMIT/OFFSET` or cursor-based), sorting, and aggregations — SQL excels here. |
+| **Indexing** | B-Tree and partial indexes let us optimise the exact query patterns (unread by student, type filter, date range). |
+| **Enum support** | Native `ENUM` type for `notification_type`. |
+| **Maturity & Ecosystem** | Proven at scale; excellent tooling (pg_stat_statements, EXPLAIN ANALYZE, logical replication). |
+| **JSON support** | `jsonb` column available if we ever need semi-structured metadata without a schema migration. |
+
+### 2.2 Database Schema (DDL)
+
+```sql
+-- Enum for notification types
+CREATE TYPE notification_type AS ENUM ('Placement', 'Event', 'Result');
+
+-- Enum for user roles
+CREATE TYPE user_role AS ENUM ('student', 'admin');
+
+-- ──────────────────────────────────────────────
+-- USERS TABLE
+-- ──────────────────────────────────────────────
+CREATE TABLE users (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name            VARCHAR(100)    NOT NULL,
+    email           VARCHAR(255)    NOT NULL UNIQUE,
+    password_hash   VARCHAR(255)    NOT NULL,
+    role            user_role       NOT NULL DEFAULT 'student',
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW(),
+    updated_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+-- ──────────────────────────────────────────────
+-- NOTIFICATIONS TABLE  (the broadcast template)
+-- ──────────────────────────────────────────────
+CREATE TABLE notifications (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    type            notification_type NOT NULL,
+    title           VARCHAR(255)    NOT NULL,
+    message         TEXT            NOT NULL,
+    priority        SMALLINT        NOT NULL DEFAULT 1,   -- 1=low … 3=high
+    created_by      UUID            REFERENCES users(id),
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+-- ──────────────────────────────────────────────
+-- STUDENT_NOTIFICATIONS  (per-student delivery)
+-- ──────────────────────────────────────────────
+CREATE TABLE student_notifications (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    student_id      UUID            NOT NULL REFERENCES users(id),
+    notification_id UUID            NOT NULL REFERENCES notifications(id),
+    is_read         BOOLEAN         NOT NULL DEFAULT FALSE,
+    read_at         TIMESTAMPTZ,
+    created_at      TIMESTAMPTZ     NOT NULL DEFAULT NOW()
+);
+
+-- ──────────────────────────────────────────────
+-- INDEXES
+-- ──────────────────────────────────────────────
+-- Primary lookup: unread notifications for a student, newest first
+CREATE INDEX idx_student_unread
+    ON student_notifications (student_id, is_read, created_at DESC);
+
+-- Filter by notification type (join with notifications table)
+CREATE INDEX idx_notification_type
+    ON notifications (type, created_at DESC);
+
+-- Partial index: only unread rows (smaller, faster)
+CREATE INDEX idx_student_unread_partial
+    ON student_notifications (student_id, created_at DESC)
+    WHERE is_read = FALSE;
+
+-- For unread-count badge
+CREATE INDEX idx_unread_count
+    ON student_notifications (student_id)
+    WHERE is_read = FALSE;
+```
+
+### 2.3 Entity-Relationship Diagram
+
+```
+┌──────────────┐       ┌───────────────────────┐       ┌────────────────────┐
+│    users     │       │  student_notifications │       │   notifications    │
+├──────────────┤       ├───────────────────────┤       ├────────────────────┤
+│ id (PK)      │◄──────│ student_id (FK)        │       │ id (PK)            │
+│ name         │       │ notification_id (FK)───┼──────►│ type               │
+│ email        │       │ is_read                │       │ title              │
+│ password_hash│       │ read_at                │       │ message            │
+│ role         │       │ created_at             │       │ priority           │
+│ created_at   │       └───────────────────────┘       │ created_by (FK)────┼──► users
+│ updated_at   │                                       │ created_at         │
+└──────────────┘                                       └────────────────────┘
+```
+
+### 2.4 Problems as Data Volume Increases
+
+| Problem | Detail |
+|---------|--------|
+| **Table bloat** | `student_notifications` grows to **50,000 × avg_notifications**. At 100 notifications per student, that's 5 million rows; at 200, it's 10 million. |
+| **Slow pagination** | `OFFSET`-based pagination degrades linearly; page 500 is much slower than page 1. |
+| **Write amplification on "Notify All"** | A single broadcast creates 50,000 inserts in `student_notifications`. |
+| **Index maintenance** | Indexes slow down INSERT-heavy workloads as they grow. |
+| **Lock contention** | Bulk inserts can block reads and vice versa. |
+| **Backup & recovery time** | Larger tables = longer `pg_dump` and restore. |
+
+### 2.5 Solutions to Scale
+
+| Solution | Description |
+|----------|-------------|
+| **Cursor-based pagination** | Replace `OFFSET` with a `WHERE created_at < :last_seen_timestamp` cursor. O(1) instead of O(n). |
+| **Table partitioning** | Range-partition `student_notifications` by `created_at` (monthly). Old partitions can be archived or detached. |
+| **Read replicas** | Route read queries (GET notifications) to replicas; keep the primary for writes. |
+| **Batch inserts** | For "Notify All", use `INSERT … SELECT` or `COPY` in batches of 1,000–5,000 rows with a message queue. |
+| **Archival / TTL** | Move notifications older than 6 months to a `student_notifications_archive` table or cold storage. |
+| **Connection pooling** | Use PgBouncer to avoid connection exhaustion under load. |
+| **Caching** | Cache unread counts and recent notifications in Redis (detailed in Stage 4). |
+
+### 2.6 SQL Queries Mapped to REST APIs
+
+#### Q1 — `POST /auth/login` → Fetch user by email
+
+```sql
+SELECT id, name, email, password_hash, role
+FROM users
+WHERE email = $1;
+```
+
+_(Password verification happens in application code using bcrypt compare.)_
+
+---
+
+#### Q2 — `GET /notifications` → Paginated notifications for student
+
+**With cursor-based pagination and optional type filter:**
+
+```sql
+SELECT
+    n.id,
+    n.type,
+    n.title,
+    n.message,
+    n.priority,
+    sn.is_read,
+    sn.created_at
+FROM student_notifications sn
+JOIN notifications n ON n.id = sn.notification_id
+WHERE sn.student_id = $1                          -- authenticated user
+  AND ($2::notification_type IS NULL OR n.type = $2)  -- optional type filter
+  AND ($3::boolean IS NULL OR sn.is_read = $3)        -- optional read filter
+  AND sn.created_at < $4                              -- cursor: last seen timestamp
+ORDER BY sn.created_at DESC
+LIMIT $5;                                            -- page size
+```
+
+---
+
+#### Q3 — `GET /notifications/:id` → Single notification
+
+```sql
+SELECT
+    n.id, n.type, n.title, n.message, n.priority, sn.is_read, sn.created_at
+FROM student_notifications sn
+JOIN notifications n ON n.id = sn.notification_id
+WHERE sn.student_id = $1
+  AND n.id = $2;
+```
+
+---
+
+#### Q4 — `PATCH /notifications/:id/read` → Mark one as read
+
+```sql
+UPDATE student_notifications
+SET is_read = TRUE, read_at = NOW()
+WHERE student_id = $1
+  AND notification_id = $2
+  AND is_read = FALSE;
+```
+
+---
+
+#### Q5 — `PATCH /notifications/read-all` → Mark all unread as read
+
+```sql
+UPDATE student_notifications
+SET is_read = TRUE, read_at = NOW()
+WHERE student_id = $1
+  AND is_read = FALSE;
+```
+
+Returns `updatedCount` via the affected-rows count.
+
+---
+
+#### Q6 — `GET /notifications/unread-count` → Badge count
+
+```sql
+SELECT COUNT(*) AS unread_count
+FROM student_notifications
+WHERE student_id = $1
+  AND is_read = FALSE;
+```
+
+---
+
+#### Q7 — `POST /admin/notifications` → Create & broadcast notification
+
+```sql
+-- Step 1: Insert the notification template
+INSERT INTO notifications (type, title, message, priority, created_by)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id;
+
+-- Step 2: Fan-out to all students (or a subset)
+INSERT INTO student_notifications (student_id, notification_id)
+SELECT id, $notification_id
+FROM users
+WHERE role = 'student';
+```
+
+---
